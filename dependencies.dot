@@ -1,0 +1,17 @@
+digraph G {
+	deploy -> stream;
+	deploy -> chord;
+	deploy -> gateway;
+	
+	stream -> gateway;
+	
+	gateway -> routes;
+	gateway -> guid;
+	
+	chord -> gateway;
+	
+	
+	dtm -> tm;
+	dtm -> gateway;
+	dtm -> chord;
+}

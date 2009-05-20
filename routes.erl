@@ -41,13 +41,22 @@ route_to(ToID, Routes) ->
 add(Dest, Router, Metric, Routes, NotifyPeers) ->
 	case dict:find(Dest, Routes) of
 		{ok, DestRoutes} ->
-			dict:store(Dest, add_route_to_list(Dest, Router, Metric, DestRoutes, NotifyPeers), Routes);
+			case add_route_to_list(Dest, Router, Metric, DestRoutes, NotifyPeers) of
+				[] -> dict:erase(Dest, Routes);
+				NewDestRoutes -> dict:store(Dest, NewDestRoutes, Routes)
+			end;
 		error ->
 			NotifyPeers(Dest, Metric),
 			dict:store(Dest, [{Router, Metric}], Routes)
 	end.
-add_route_to_list(Dest, Router, Metric, DestRoutes, NotifyPeers) -> add_route_to_list([], Dest, Router, Metric, DestRoutes, NotifyPeers).
-add_route_to_list(Acc, _, nil, nil, [], _) -> lists:reverse(Acc);
+	
+add_route_to_list(Dest, Router, Metric, DestRoutes, NotifyPeers) ->
+	add_route_to_list([], Dest, Router, Metric, DestRoutes, NotifyPeers).
+add_route_to_list(Acc, _, nil, nil, [], _) ->
+	lists:filter(fun
+		({_, infinity}) -> false;
+		(_) -> true
+	end, lists:reverse(Acc));
 add_route_to_list(Acc, Dest, nil, nil, [Route|Rest], NotifyPeers) -> add_route_to_list([Route|Acc], Dest, nil, nil, Rest, NotifyPeers);
 add_route_to_list(Acc, Dest, Router, Metric, [], NotifyPeers) -> % add route to end of list
 	NotifyPeers(Dest, Metric),
@@ -64,9 +73,13 @@ add_route_to_list(Acc, Dest, Router, Metric, [OtherRoute|Rest], NotifyPeers) ->
 
 % Remove routes that route immediately through RemoveRouter
 remove_through(RemoveRouter, Routes, NotifyPeers) ->
-	dict:map(fun(Dest, DestRoutes) ->
-		remove_through_from_list(RemoveRouter, Dest, DestRoutes, NotifyPeers)
-	end, Routes).
+	dict:filter(
+		fun (_, DestRoutes) -> % drop the empty lists
+			DestRoutes =/= []
+		end,
+		dict:map(fun(Dest, DestRoutes) ->
+			remove_through_from_list(RemoveRouter, Dest, DestRoutes, NotifyPeers)
+		end, Routes)).
 remove_through_from_list(RemoveRouter, Dest, List, NotifyPeers) -> remove_through_from_list([], RemoveRouter, Dest, List, NotifyPeers).
 remove_through_from_list(Acc, _, _, [], _) -> lists:reverse(Acc);
 remove_through_from_list(Acc, RemoveRouter, Dest, [{RemoveRouter, _}|Rest], NotifyPeers) ->

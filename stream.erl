@@ -25,7 +25,44 @@ run_test(Test) ->
 	end.
 	
 test() ->
-	run_test(fun test_channel_send/0).
+	run_test(fun test_channel_send/0),
+	run_test(fun test_performance/0).
+
+test_performance() ->
+	{ok, Gateway1} = gateway:start_link(),
+	gateway:listen(Gateway1, {127,0,0,1}, 1234),
+	{ok, Gateway2} = gateway:start_link(),
+	gateway:connect(Gateway2, {127,0,0,1}, 1234, 1),
+	{ok, Stream1} = stream:start_link(Gateway1, stream),
+	{ok, Stream2} = stream:start_link(Gateway2, stream),
+	receive after 500 -> ok end,
+	
+	Channel = stream:make_channel(Stream1),
+	Sender = stream:make_sender(Stream2, Channel),
+	
+	spawn_link(fun() -> test_performance_send(64 * 1024, 500, Sender) end),
+	Start = now(),
+	test_performance_recv(Channel),
+	End = now(),
+	timer:now_diff(End, Start) / 1000000.
+	
+
+test_performance_send(_, 0, Sender) -> Sender(close);
+test_performance_send(Data, Times, Sender) when is_binary(Data) ->
+	%io:format("sending ~p ~p~n", [Times, size(Data)]),
+	Sender(Data), test_performance_send(Data, Times - 1, Sender);
+test_performance_send(Bytes, Times, Sender) ->
+	Bits = Bytes * 8,
+	test_performance_send(<<1:Bits>>, Times, Sender).
+
+test_performance_recv(Channel) ->
+	ready_to_receive(Channel),
+	receive
+		{packet, Channel, _Data} ->
+			test_performance_recv(Channel);
+		{close, Channel} ->
+			ok
+	end.
 
 test_channel_send() ->
 	{ok, Gateway1} = gateway:start_link(),
@@ -44,13 +81,13 @@ test_channel_send() ->
 	Sender(Data),
 	Sender(close),
 	
-	io:format("~p~n", [recv_loop([], Channel)]).
+	Data = test_recv_loop([], Channel).
 
-recv_loop(Acc, Channel) ->
+test_recv_loop(Acc, Channel) ->
 	ready_to_receive(Channel),
 	receive
 		{packet, Channel, Data} ->
-			recv_loop([Data|Acc], Channel);
+			test_recv_loop([Data|Acc], Channel);
 		{close, Channel} ->
 			iolist_to_binary(lists:reverse(Acc))
 	end.
@@ -139,7 +176,7 @@ send_chunk(Chunk, Rest, Sequence) ->
 	self() ! {chunk, Chunk, Sequence, 60},
 	chunkify(Rest, Sequence + 1).
 chunkify(<<>>, Sequence) -> Sequence;
-chunkify(<<Chunk:4/binary, Rest/binary>>, Sequence) ->
+chunkify(<<Chunk:(64 * 1024)/binary, Rest/binary>>, Sequence) -> % 64K "packets" turn out pretty well (in loopback tests, at least)
 	send_chunk(Chunk, Rest, Sequence);
 chunkify(Chunk, Sequence) ->
 	send_chunk(Chunk, <<>>, Sequence).

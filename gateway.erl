@@ -33,6 +33,7 @@
 % API
 -export([start_link/0, start_link/1, listen/3, connect/4]).
 -export([register/3, get_name/1]).
+-export([show_routes/1]).
 -export([call/1, call/2, call/3, call/4, call/5, call_group/1, call_group/2, call_group/3, call_group/4]).
 -export([cast/1, cast/2, cast/3, cast/4, cast_group/1, cast_group/2, cast_group/3]).
 
@@ -112,10 +113,13 @@ connect(Server, Address, Port, Metric) ->
 	gen_server:cast(Server, {connect, Address, Port, Metric}).
 
 send_message(Server, To, ServiceName, Message) ->
-	gen_server:call(Server, {send_message, To, ServiceName, Message}).
+	gen_server:cast(Server, {send_message, To, ServiceName, Message}).
 
 get_name(Server) ->
-	gen_server:call(Server, {get_name}).
+	gen_server:call(Server, get_name).
+	
+show_routes(Server) ->
+	gen_server:cast(Server, show_routes).
 
 % register adds this node to a group named Group. Any node may send a message
 % to that group and the message will go to the nearest node in that group.
@@ -273,14 +277,28 @@ send_metric(Socket, Metric) ->
 
 negotiate_id(Socket, MyID) -> negotiate_id(Socket, MyID, infinity).
 negotiate_id(Socket, MyID, Timeout) ->
-	gen_tcp:send(Socket, term_to_binary({id, MyID})),
+	Version = 1,
+	gen_tcp:send(Socket, term_to_binary({version, Version})),
 	inet:setopts(Socket, [{active, once}]),
 	receive
-		{tcp, Socket, Data} ->
-			{id, RemoteID} = binary_to_term(Data),
-			{ok, RemoteID}
+		{tcp, Socket, VersionData} ->
+			VersionTerm = binary_to_term(VersionData),
+			if
+				VersionTerm =:= {version, Version} ->
+					gen_tcp:send(Socket, term_to_binary({id, MyID})),
+					inet:setopts(Socket, [{active, once}]),
+					receive
+						{tcp, Socket, Data} ->
+							{id, RemoteID} = binary_to_term(Data),
+							{ok, RemoteID}
+					after
+						Timeout -> negotiate_id_timeout
+					end;
+				true ->
+					version_mismatch
+			end
 	after
-		Timeout -> negotiate_id_timeout
+		Timeout -> negotiate_version_timeout
 	end.
 
 do_send_message(Server, MyID, MyID, Message, _) -> % loopback message
@@ -336,19 +354,27 @@ next_wait(Wait) -> Wait * 2. % double the wait each time (exponential)
 
 do_connect(Server, MyID, Address, Port, Metric, Wait) ->
 	receive after Wait -> ok end,
+	io:format("connecting...~n"),
 	case gen_tcp:connect(Address, Port, [binary, {active, once}, {packet, 4}]) of
 		{ok, Socket} ->
 			send_metric(Socket, Metric),
-			{ok, PeerID} = negotiate_id(Socket, MyID),
-			add_peer(Server, PeerID, self(), Metric),
-			try
-				worker(Server, Socket, MyID, PeerID)
-			after
-				gen_tcp:close(Socket),
-				remove_peer(Server, self()),
-				do_connect(Server, MyID, Address, Port, Metric, 0) % automatically reconnect
+			case negotiate_id(Socket, MyID) of
+				{ok, PeerID} ->
+					io:format("connected.~n"),
+					add_peer(Server, PeerID, self(), Metric),
+					try
+						worker(Server, Socket, MyID, PeerID)
+					after
+						gen_tcp:close(Socket),
+						remove_peer(Server, self()),
+						do_connect(Server, MyID, Address, Port, Metric, 0) % automatically reconnect
+					end;
+				_ ->
+					io:format("failed to negotiate. retrying...~n"),
+					do_connect(Server, MyID, Address, Port, Metric, next_wait(Wait))
 			end;
 		{error, _} -> % retry after a delay
+			io:format("failed to connect. retrying...~n"),
 			do_connect(Server, MyID, Address, Port, Metric, next_wait(Wait))
 	end.
 
@@ -369,16 +395,7 @@ handle_call(Request, Client, State) ->
 				error -> {reply, ok, State}
 			end;
 
-		{send_message, ToID, ServiceName, Message} ->
-			Server = self(),
-			spawn_link(fun() ->
-				try
-					do_send_message(Server, MyID, ToID, {message, ServiceName, Message}, Routes)
-				after
-					gen_server:reply(Client, ok)
-				end
-			end),
-			{noreply, State};
+		
 		{forward_message, FromID, ToID, Message} ->
 			do_send_message(self(), FromID, ToID, Message, Routes),
 			{reply, ok, State};
@@ -407,7 +424,7 @@ handle_call(Request, Client, State) ->
 			end),
 			{noreply, State};
 		
-		{get_name} ->
+		get_name ->
 			{reply, MyID, State}
 	end.
 
@@ -424,6 +441,13 @@ handle_cast(Request, State) ->
 			Server = self(),
 			spawn_link(fun() -> do_connect(Server, MyID, Address, Port, Metric, 0) end),
 			{noreply, State};
+			
+		{send_message, ToID, ServiceName, Message} ->
+			Server = self(),
+			spawn_link(fun() ->
+				do_send_message(Server, MyID, ToID, {message, ServiceName, Message}, Routes)
+			end),
+			{noreply, State};
 		
 		{receive_message, _FromID, heartbeat} ->
 			{noreply, State};
@@ -431,7 +455,10 @@ handle_cast(Request, State) ->
 			%io:format("~p learned that ~p can route to ~p with metric ~p~n", [MyID, FromID, Dest, Metric]),
 			Peer = dict:fetch(FromID, Peers),
 			HopMetric = dict:fetch(FromID, Metrics),
-			RouteMetric = Metric + HopMetric,
+			RouteMetric = if
+				Metric =:= infinity -> infinity;
+				true -> Metric + HopMetric
+			end,
 			NewRoutes = routes:add(Dest, Peer, RouteMetric, Routes, notify_peers(Peers, Peer, MyID)),
 			{noreply, {Services, MyID, Peers, PeerIDs, Metrics, NewRoutes, Timers}};
 		
@@ -445,7 +472,6 @@ handle_cast(Request, State) ->
 						{ok, Service} ->
 							Service ! {gateway, self(), FromID, ServiceName, Message};
 						error ->
-							io:format("DROPPED A MESSAGE~n"),
 							drop_message
 					end
 			end,
@@ -456,6 +482,12 @@ handle_cast(Request, State) ->
 			spawn_link(fun() ->
 				do_cast(Server, ToID, ServiceName, Cast)
 			end),
+			{noreply, State};
+		
+		show_routes ->
+			dict:map(fun(Key, Value) ->
+				io:format("~p ~p~n", [Key, Value])
+			end, Routes),
 			{noreply, State}
 	end.
 
