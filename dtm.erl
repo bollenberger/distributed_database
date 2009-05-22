@@ -244,7 +244,7 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 	{ok, Chord} = chord:start_link(Gateway, ServiceName, Bootstrap),
 	
 	% On node join, re-replicate all keys, since any may need to be replicated to the new node
-	chord:on_node_join(Chord, fun(Node) ->
+	chord:on_node_join(Chord, fun(_) ->
 		tm:for_each_key(TM, fun(Key) ->
 			reify(Gateway, SN, Key)
 		end)
