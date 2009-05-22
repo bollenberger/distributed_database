@@ -11,9 +11,7 @@ run_test(Test) ->
 		Me ! try
 			{ok, Test()}
 		catch
-			throw:Error -> {throw, Error};
-			error:Error -> {error, Error};
-			exit:Error -> {exit, Error}
+			throw:Error -> {throw, Error}
 		end,
 		exit(shutdown)
 	end),

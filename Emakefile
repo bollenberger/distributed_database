@@ -2,7 +2,8 @@ guid.
 routes.
 gateway.
 stream.
+key_ranges.
 chord.
 tm.
 dtm.
-
+deploy.

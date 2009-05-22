@@ -39,7 +39,6 @@ module_reader(Acc, Module, File, Channel) ->
 		{packet, Channel, Data} ->
 			module_reader([Data|Acc], Module, File, Channel);
 		{close, Channel} ->
-			io:format("loading ~p~n", [Module]),
 			{module, Module} = code:load_binary(Module, File, iolist_to_binary(lists:reverse(Acc)))
 	after
 		30000 -> % inactivity timeout
@@ -48,7 +47,6 @@ module_reader(Acc, Module, File, Channel) ->
 	
 get_modules(_, _, _, []) -> done;
 get_modules(Cast, Stream, From, [{Module, File}|Rest]) ->
-	io:format("get_modules ~p~n", [Module]),
 	Channel = stream:make_channel(Stream),
 	Cast(From, {get_module, Module, Channel}),
 	module_reader(Module, File, Channel),
@@ -75,7 +73,6 @@ handle_cast(Request, State) ->
 			spawn_link(fun() ->
 				% For each Chord finger
 				lists:map(fun(Node) ->
-					io:format("node: ~p~n", [Node]),
 					Mods = lists:map(fun(Module) ->
 						{Module, code:which(Module)}
 					end, Modules),
@@ -87,7 +84,6 @@ handle_cast(Request, State) ->
 		{notify, From, Modules, NewVersion} when NewVersion > OldVersion ->
 			Deploy = self(),
 			spawn_link(fun() ->
-				io:format("notified ~p ~p~n", [Modules, NewVersion]),
 				get_modules(Cast, Stream, From, Modules),
 				update(Deploy, lists:map(fun({Module, _}) -> Module end, Modules), NewVersion)
 			end),

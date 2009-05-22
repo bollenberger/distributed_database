@@ -14,4 +14,6 @@ digraph G {
 	dtm -> tm;
 	dtm -> gateway;
 	dtm -> chord;
+	
+	dtm -> stream;
 }

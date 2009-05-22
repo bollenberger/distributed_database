@@ -6,40 +6,44 @@
 -behaviour(gen_server).
 
 -export([test/0]).
--export([start_link/4, transaction/2]).
+-export([start_link/4, transaction/3, transaction/4]).
 -export([init/1, terminate/2, handle_info/2, handle_call/3, handle_cast/2, code_change/3]).
+
+-define(KEEP_ALIVE_INTERVAL, 10000).
+-define(GC_INTERVAL_MULTIPLE, 6).
 
 workload(DTM) ->
 	Times = 100,
-	A = 100, B = -100,
-	dtm:transaction(DTM, fun(_, Put, _) ->
-		Put(a, A), Put(b, B)
-	end),
+	%A = 100, B = -100,
+	%transaction(DTM, fun(_, Put, _) ->
+	%	Put(a, A), Put(b, B)
+	%end),
 	
 	Parent = self(),
 	spawn_link(fun() -> workload(DTM, 1, Times), Parent ! done end),
 	spawn_link(fun() -> workload(DTM, -1, Times), Parent ! done end),
 	wait(2),
 
-	dtm:transaction(DTM, fun(Get, _, Delete) ->
-		{ok, A} = Get(a),
-		{ok, B} = Get(b),
-		Delete(a), Delete(b)
-	end),
-	dtm:transaction(DTM, fun(Get, _, _) ->
-		no_value = Get(a),
-		no_value = Get(b)
-	end).
+	%transaction(DTM, fun(Get, _, Delete) ->
+	%	{ok, A} = Get(a),
+	%	{ok, B} = Get(b),
+	%	Delete(a), Delete(b)
+	%end),
+	%transaction(DTM, fun(Get, _, _) ->
+	%	no_value = Get(a),
+	%	no_value = Get(b)
+	%end).
+	ok.
 	
 workload(_, _, 0) -> ok;
 workload(DTM, Increment, Times) ->
-	dtm:transaction(DTM, fun(Get, Put, _) ->
-		{ok, A} = Get(a),
-		{ok, B} = Get(b),
-		io:format("~p ~p ~p~n", [A, B, Increment]),
-		Put(a, A + Increment),
-		Put(b, B - Increment)
-	end),
+	%transaction(DTM, fun(Get, Put, _) ->
+	%	{ok, A} = Get(a),
+	%	{ok, B} = Get(b),
+	%	io:format("~p ~p ~p~n", [A, B, Increment]),
+	%	Put(a, A + Increment),
+	%	Put(b, B - Increment)
+	%end),
 	workload(DTM, Increment, Times - 1).
 	
 node_a(Main) ->
@@ -84,9 +88,7 @@ run_test(Test) ->
 		Me ! try
 			{ok, Test()}
 		catch
-			throw:Error -> {throw, Error};
-			error:Error -> {error, Error};
-			exit:Error -> {exit, Error}
+			throw:Error -> {throw, Error}
 		end,
 		exit(shutdown)
 	end),
@@ -100,124 +102,179 @@ run_test(Test) ->
 test() ->
 	run_test(fun test_consistency/0).
 
-% Takes an Operation/3 function that takes Get, Put, and Delete
-% operations as parameters.
-% If Operation throws an exception, the transaction will be aborted and the exception will be thrown by transaction().
-% If Operation returns abort, the transaction is aborted and transaction returns {abort, abort}.
-% Any other return value of Operation will cause the transaction to be committed.
-% If required, the Operation may be retried automatically, so it must not have any side effects.
-% On successful commit or abort, transaction() returns the return value of Operation.
-transaction(DTM, Operation) -> transaction(DTM, Operation, 0, 0).
-transaction(DTM, Operation, Clock, Wait) ->
+% RPC transaction stub for pure clients of DTM.
+% returns one of:
+% ok
+% {ok, Result}
+% {abort, Reason}
+% {timeout, TimedoutOperation}
+% or throws any error thrown by Operation, unless it is {retry, _} or transaction_timeout
+% in which case it will have the associated effect. You should not throw those things from
+% Operation in general.
+transaction(Gateway, ServiceName, RpcTimeout) -> % curry the transaction stub to only require an operation
+	fun(Operation) ->
+		transaction(Gateway, ServiceName, RpcTimeout, Operation)
+	end.
+transaction(Gateway, ServiceName, RpcTimeout, Operation) ->
+	transaction(Gateway, ServiceName, RpcTimeout, Operation, 0, 0).
+transaction(Gateway, SN, RpcTimeout, Operation, Clock, Wait) ->
 	receive after Wait -> ok end,
-	Tid = begin_transaction(DTM, Clock),
-	Get = fun(Key) ->
-		XX = get(DTM, Tid, Key),
-		%io:format("~p: Get(~p) = ~p~n", [Tid, Key, XX]),
-		case XX of
-			{retry, NewClock} -> throw({retry, NewClock});
-			no_value -> no_value;
-			{ok, X} -> {ok, X}
-		end
-	end,
-	Put = fun(Key, Value) ->
-		XX = put(DTM, Tid, Key, Value),
-		%io:format("~p: Put(~p, ~p) = ~p~n", [Tid, Key, Value, XX]),
-		case XX of
-			{retry, NewClock} -> throw({retry, NewClock});
-			ok -> ok
-		end
-	end,
-	Delete = fun(Key) ->
-		case delete(DTM, Tid, Key) of
-			{retry, NewClock} -> throw({retry, NewClock});
-			ok -> ok
-		end
-	end,
+	ServiceName = {?MODULE, SN},
 	
-	% abort, {ok, Output}, {retry, NewClock}, or aborts and throws error
-	Result = try
-		case Operation(Get, Put, Delete) of
-			abort ->
-				ok = abort(DTM, Tid),
-				abort;
-			Output ->
-				case commit(DTM, Tid) of
-					ok -> Output;
-					abort -> throw({retry, 0})
+	case gateway:call_group(Gateway, RpcTimeout, ServiceName, {begin_transaction, Clock, RpcTimeout}) of
+		timeout ->
+			{timeout, begin_transaction};
+		{ok, {Tid, PeerName}} ->
+			Call = gateway:call(Gateway, RpcTimeout, ServiceName, PeerName),
+			Cast = gateway:cast(Gateway, ServiceName, PeerName),
+	
+			Get = fun(Key) ->
+				case Call({get, Tid, Key, RpcTimeout}) of
+					{ok, {ok, X}} -> {ok, X};
+					{ok, no_value} -> no_value;
+					{ok, {retry, NewClock}} -> throw({retry, NewClock});
+					timeout -> throw({timeout, {get, Key}})
 				end
-		end
-	catch
-		throw:{retry, NewClock} ->
-			abort(DTM, Tid), {retry, NewClock};
-		throw:Error ->
-			abort(DTM, Tid), throw(Error);
-		exit:Error ->
-			abort(DTM, Tid), exit(Error);
-		error:Error ->
-			abort(DTM, Tid), erlang:error(Error)
-	end,
-
-	case Result of
-		abort -> abort;
-		{retry, NewClock2} ->
-			%io:format("retry ~p ~p~n", [Tid, NewClock2]),
-			transaction(DTM, Operation, NewClock2, next_wait(Wait));
-		_ ->
-			%io:format("done transaction ~p ~p~n", [Tid, Result]),
-			Result
+			end,
+			Put = fun(Key, Value) ->
+				case Call({put, Tid, Key, Value, RpcTimeout}) of
+					{ok, ok} -> ok;
+					{ok, {retry, NewClock}} -> throw({retry, NewClock});
+					timeout -> throw({timeout, {put, Key}})
+				end
+			end,
+			Delete = fun(Key) ->
+				case Call({delete, Tid, Key, RpcTimeout}) of
+					{ok, ok} -> ok;
+					{ok, {retry, NewClock}} -> throw({retry, NewClock});
+					timeout -> throw({timeout, {delete, Key}})
+				end
+			end,
+	
+			Result = try
+				% case may return:
+				% {ok, Result}
+				% {abort, Reason}
+				% or throw:
+				% {retry, 0}
+				% transaction_timeout
+				case Operation(Get, Put, Delete) of
+					ok ->
+						case Call({commit, Tid, RpcTimeout}) of
+							{ok, ok} -> {ok, ok};
+							{ok, abort} -> throw({retry, 0});
+							timeout -> throw({timeout, commit_transaction})
+						end;
+					{ok, Output} ->
+						case Call({commit, Tid, RpcTimeout}) of
+							{ok, ok} -> {ok, Output};
+							{ok, abort} -> throw({retry, 0});
+							timeout -> throw({timeout, commit_transaction})
+						end;
+				
+					Reason ->
+						Cast({abort, Tid}),
+						{abort, Reason}
+				end
+			catch
+				throw:{retry, NewClock} ->
+					Cast({abort, Tid}), {retry, NewClock};
+				throw:{timeout, TimeoutOperation} ->
+					Cast({abort, Tid}), {timeout, TimeoutOperation};
+				throw:Error ->
+					Cast({abort, Tid}), throw(Error)
+				%exit:Error ->
+				%	Cast({abort, Tid}), exit(Error);
+				%error:Error ->
+				%	Cast({abort, Tid}), erlang:error(Error)
+			end,
+	
+			case Result of
+				{ok, _} -> Result;
+				{abort, _} -> Result;
+				{timeout, _} -> Result;
+				{retry, NewClock2} ->
+					transaction(Gateway, SN, RpcTimeout, Operation,
+						NewClock2, next_wait(Wait))
+			end
 	end.
 
 next_wait(0) -> 50; % start at 50 ms
 next_wait(Wait) when Wait >= 10000 -> 10000; % max 10 s wait
 next_wait(Wait) -> Wait * 2. % double the wait each time (exponential)
 
-start_link(Gateway, ServiceName, Replication, Bootstrap) when Replication > 0 ->
-	gen_server:start_link(?MODULE, [Gateway, ServiceName, Replication, Bootstrap], []).
+start_link(Gateway, SN, Replication, Bootstrap) when Replication > 0 ->
+	gen_server:start_link(?MODULE, [Gateway, SN, Replication, Bootstrap], []).
 
-begin_transaction(DTM, Clock) ->
-	gen_server:call(DTM, {begin_transaction, Clock}).
+begin_transaction(DTM, Clock, Timeout) ->
+	gen_server:call(DTM, {begin_transaction, Clock}, Timeout + 5000).
 
 % returns {ok, Value}, no_value, {retry, Clock}
-get(DTM, Tid, Key) ->
-	case gen_server:call(DTM, {get, Tid, Key}) of
-		{retry, Clock} -> throw({retry, Clock});
-		Result -> Result
-	end.
+get(DTM, Tid, Key, Timeout) ->
+	gen_server:call(DTM, {get, Tid, Key}, Timeout + 5000).
 
 % returns ok, {retry, Clock}
-put(DTM, Tid, Key, Value) ->
-	case gen_server:call(DTM, {put, Tid, Key, Value}) of
-		{retry, Clock} -> throw({retry, Clock});
-		Result -> Result
-	end.
+put(DTM, Tid, Key, Value, Timeout) ->
+	gen_server:call(DTM, {put, Tid, Key, Value}, Timeout + 5000).
 
 % returns ok, {retry, Clock}
-delete(DTM, Tid, Key) ->
-	case gen_server:call(DTM, {delete, Tid, Key}) of
-		{retry, Clock} -> throw({retry, Clock});
-		Result -> Result
-	end.
+delete(DTM, Tid, Key, Timeout) ->
+	gen_server:call(DTM, {delete, Tid, Key}, Timeout + 5000).
 
 % returns ok or abort
-commit(DTM, Tid) ->
-	gen_server:call(DTM, {commit, Tid}).
+commit(DTM, Tid, Timeout) ->
+	gen_server:call(DTM, {commit, Tid}, Timeout + 5000).
 
 % returns ok
 abort(DTM, Tid) ->
 	gen_server:call(DTM, {abort, Tid}).
 
-service_name(ServiceName, Replication) ->
-	{?MODULE, ServiceName, Replication}.
 init([Gateway, SN, Replication, Bootstrap]) ->
-	ServiceName = service_name(SN, Replication),
-	
-	{ok, Chord} = chord:start_link(Gateway, ServiceName, Bootstrap),
-	
+	{ok, _} = timer:send_after(?KEEP_ALIVE_INTERVAL, keep_alive),
+	{ok, _} = timer:send_after(?GC_INTERVAL_MULTIPLE * ?KEEP_ALIVE_INTERVAL, gc),
+
+	ServiceName = {?MODULE, SN},
+	DTM = self(),
 	{ok, TM} = tm:start_link(),
 	Name = gateway:get_name(Gateway),
+	Hash = crypto:sha(Name),
 	Clock = 0,
 	Transactions = dict:new(),
+	KeyRanges = [],
+	{ok, Chord} = chord:start_link(Gateway, ServiceName, Bootstrap),
+	
+	% On node join, re-replicate all keys, since any may need to be replicated to the new node
+	chord:on_node_join(Chord, fun(_) ->
+		tm:for_each_key(TM, fun(Key) ->
+			reify(Gateway, SN, Key)
+		end)
+	end),
+	
+	% On node leave, re-replicate all keys not in (P, N], since those belong to this node
+	chord:on_node_leave(Chord, fun(Node) ->
+		tm:for_each_key(TM, fun(Key) ->
+			case key_ranges:in_half_open_range(crypto:sha(term_to_binary(Key)), Node, Hash) of
+				true -> skip;
+				_ -> reify(Gateway, SN, Key)
+			end
+		end)
+	end),
+	
+	
+	TransactionRpcHandler = fun
+		(call, _, {begin_transaction, MinClock, Timeout}) ->
+			{begin_transaction(DTM, MinClock, Timeout), Name};
+		(call, _, {get, Tid, Key, Timeout}) ->
+			get(DTM, Tid, Key, Timeout);
+		(call, _, {put, Tid, Key, Value, Timeout}) ->
+			put(DTM, Tid, Key, Value, Timeout);
+		(call, _, {delete, Tid, Key, Timeout}) ->
+			delete(DTM, Tid, Key, Timeout);
+		(cast, _, {abort, Tid}) ->
+			abort(DTM, Tid);
+		(call, _, {commit, Tid, Timeout}) ->
+			commit(DTM, Tid, Timeout)
+	end,
 	
 	RpcHandler = fun
 		(call, _, {get, Tid, Key}) ->
@@ -231,15 +288,33 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 		(call, _, {prepare, Tid}) ->
 			tm:prepare(TM, Tid);
 		(cast, _, {commit, Tid}) ->
-			tm:commit(TM, Tid)
+			tm:commit(TM, Tid);
+		
+		(cast, _, {keep_alive, From, To, R}) ->
+			keep_alive(DTM, From, To, R)
 	end,
-	RpcTimeout = 5000,
+	RpcTimeout = 4000,
 	
-	ok = gateway:register(Gateway, ServiceName, RpcHandler),
-	RPC_Call = gateway:call(Gateway, RpcTimeout, ServiceName),
-	RPC_Cast = gateway:cast(Gateway, ServiceName),
+	ok = gateway:register(Gateway, ServiceName, TransactionRpcHandler),
+	InternalServiceName = {?MODULE, internal, ServiceName},
+	ok = gateway:register(Gateway, InternalServiceName, RpcHandler),
+	RPC_Call = gateway:call(Gateway, RpcTimeout, InternalServiceName),
+	RPC_Cast = gateway:cast(Gateway, InternalServiceName),
 	
-	{ok, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions}}.
+	{ok, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions, KeyRanges}}.
+
+% re-replicate a key: Put(Key, Get(Key))
+reify(Gateway, ServiceName, Key) ->
+	transaction(Gateway, ServiceName, 5000, fun(Get, Put, _) ->
+		case Get(Key) of
+			no_value -> ok;
+			{ok, Value} ->
+				ok = Put(Key, Value)
+		end
+	end).
+	
+keep_alive(DTM, From, To, Replication) ->
+	gen_server:cast(DTM, {keep_alive, From, To, Replication}).
 
 % Make a numeric transaction ID representing the tuple {Clock, Name}
 % This is necessary because the transaction manager only accepts
@@ -361,12 +436,12 @@ reduce_prepare_results(Result, Acc) ->
 	end.
 
 handle_call(Request, Client, State) ->
-	{{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions} = State,
+	{{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions, KeyRanges} = State,
 	case Request of
 		{begin_transaction, MinimumTid} ->
 			NewClock = new_clock(Clock, Name, MinimumTid),
 			Tid = make_tid(NewClock, Name),
-			{reply, Tid, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, NewClock, dict:store(Tid, sets:new(), Transactions)}};
+			{reply, Tid, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, NewClock, dict:store(Tid, sets:new(), Transactions, KeyRanges)}};
 
 		{get, Tid, Key} ->
 			Nodes = find_nodes(Chord, Key, Replication),
@@ -383,7 +458,7 @@ handle_call(Request, Client, State) ->
 				end,
 				gen_server:reply(Client, EndResult)
 			end),
-			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, NewTransactions}};
+			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, NewTransactions, KeyRanges}};
 
 		{put, Tid, Key, Value} ->
 			Nodes = find_nodes(Chord, Key, Replication),
@@ -399,7 +474,7 @@ handle_call(Request, Client, State) ->
 				end,
 				gen_server:reply(Client, EndResult)
 			end),
-			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, NewTransactions}};
+			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, NewTransactions, KeyRanges}};
 
 		{delete, Tid, Key} ->
 			Nodes = find_nodes(Chord, Key, Replication),
@@ -417,7 +492,7 @@ handle_call(Request, Client, State) ->
 				end,
 				gen_server:reply(Client, EndResult)
 			end),
-			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, NewTransactions}};
+			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, NewTransactions, KeyRanges}};
 
 		{commit, Tid} ->
 			% If the transaction coordinator gets to commit,
@@ -448,14 +523,17 @@ handle_call(Request, Client, State) ->
 
 				gen_server:reply(Client, Result)
 			end),
-			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, dict:erase(Tid, Transactions)}};
+			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, dict:erase(Tid, Transactions), KeyRanges}};
 		{abort, Tid} ->
-			Nodes = dict:fetch(Tid, Transactions),
-			spawn_link(fun() ->
-				do_abort(RPC_Cast, Nodes, Tid),
-				gen_server:reply(Client, ok)
-			end),
-			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, dict:erase(Tid, Transactions)}}
+			case dict:find(Tid, Transactions) of
+				error -> do_nothing; % commit failed
+				{ok, Nodes} ->
+					spawn_link(fun() ->
+						do_abort(RPC_Cast, Nodes, Tid),
+						gen_server:reply(Client, ok)
+					end)
+			end,
+			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, dict:erase(Tid, Transactions), KeyRanges}}
 	end.
 
 do_abort(RPC_Cast, Nodes, Tid) ->
@@ -463,11 +541,48 @@ do_abort(RPC_Cast, Nodes, Tid) ->
 		fun(Node) -> RPC_Cast(Node, {abort, Tid}) end,
 		fun(_, _) -> ok end).
 
-handle_cast(_Request, State) ->
-	{noreply, State}.
+handle_cast(Request, State) ->
+	{{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions, KeyRanges} = State,
+	case Request of
+		{keep_alive, From, To, Replication} ->
+			NewKeyRanges = key_ranges:add(From, To, KeyRanges),
+			send_keep_alive(RPC_Cast, Chord, From, To, Replication - 1),
+			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions, NewKeyRanges}}
+	end.
 
-handle_info(_Request, State) ->
-	{noreply, State}.
+handle_info(Request, State) ->
+	{{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions, KeyRanges} = State,
+	case Request of
+		keep_alive ->
+			Predecessor = chord:get_predecessor(Chord),
+			send_keep_alive(RPC_Cast, Chord, Predecessor, crypto:sha(Name), Replication),
+			{noreply, State};
+		
+		gc -> % Garbage collect unowned keys that no longer belong on this node.
+			{Expired, NewKeyRanges} = key_ranges:expire(KeyRanges),
+			if
+				Expired -> spawn_link(fun() ->
+					tm:for_each_key(TM, fun(Key) ->
+						case key_ranges:in_ranges(Key, NewKeyRanges) of
+							true -> keep_live_key;
+							_ ->
+								Predecessor = chord:get_predecessor(Chord),
+								case key_ranges:in_half_open_range(Key, Predecessor, crypto:sha(Name)) of
+									true -> keep_owned_key;
+									_ -> tm:forget(TM, Key) % forget an unowned key that has expired
+								end
+						end
+					end)
+				end);
+				true -> no_change
+			end,
+			{noreply, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions, NewKeyRanges}}
+	end.
+
+send_keep_alive(_, _, _, _, Replication) when Replication =< 1 -> done;
+send_keep_alive(RPC_Cast, Chord, From, To, Replication) ->
+	Successor = chord:get_successor(Chord),
+	RPC_Cast(Successor, {keep_alive, From, To, Replication}).
 
 terminate(_Reason, _State) -> ok.
 

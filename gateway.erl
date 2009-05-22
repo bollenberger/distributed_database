@@ -45,9 +45,7 @@ run_test(Test) ->
 		Me ! try
 			{ok, Test()}
 		catch
-			throw:Error -> {throw, Error};
-			error:Error -> {error, Error};
-			exit:Error -> {exit, Error}
+			throw:Error -> {throw, Error}
 		end,
 		exit(shutdown)
 	end),
@@ -354,13 +352,11 @@ next_wait(Wait) -> Wait * 2. % double the wait each time (exponential)
 
 do_connect(Server, MyID, Address, Port, Metric, Wait) ->
 	receive after Wait -> ok end,
-	io:format("connecting...~n"),
 	case gen_tcp:connect(Address, Port, [binary, {active, once}, {packet, 4}]) of
 		{ok, Socket} ->
 			send_metric(Socket, Metric),
 			case negotiate_id(Socket, MyID) of
 				{ok, PeerID} ->
-					io:format("connected.~n"),
 					add_peer(Server, PeerID, self(), Metric),
 					try
 						worker(Server, Socket, MyID, PeerID)
@@ -370,11 +366,9 @@ do_connect(Server, MyID, Address, Port, Metric, Wait) ->
 						do_connect(Server, MyID, Address, Port, Metric, 0) % automatically reconnect
 					end;
 				_ ->
-					io:format("failed to negotiate. retrying...~n"),
 					do_connect(Server, MyID, Address, Port, Metric, next_wait(Wait))
 			end;
 		{error, _} -> % retry after a delay
-			io:format("failed to connect. retrying...~n"),
 			do_connect(Server, MyID, Address, Port, Metric, next_wait(Wait))
 	end.
 
@@ -507,9 +501,9 @@ rpc_loop(Gateway, ServiceName, Handler) ->
 				Response = try
 					{ok, Handler(call, FromID, Call)}
 				catch
-					throw:Error -> {throw, Error};
-					error:Error -> {error, Error};
-					exit:Error -> {exit, Error}
+					throw:Error -> {throw, Error}%;
+					%error:Error -> {error, Error};
+					%exit:Error -> {exit, Error}
 				end,
 				send_message(Gateway, FromID, ServiceName, {response, RespondTo, CallID, Response})
 			end);

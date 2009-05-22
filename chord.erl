@@ -3,13 +3,16 @@
 -behaviour(gen_server).
 
 -export([test/0]).
--export([start_link/3, find_successor/2, get_fingers/1]).
+
+-export([start_link/3, find_successor/2, get_predecessor/1, get_successor/1, get_fingers/1]).
+-export([on_node_join/2, on_node_leave/2]).
+
 -export([init/1, terminate/2, handle_info/2, handle_call/3, handle_cast/2, code_change/3]).
 
 -define(FIX_FINGERS_INTERVAL, 5000).
 -define(STABILIZE_INTERVAL, 1000).
 -define(CHECK_PREDECESSOR_INTERVAL, 5000).
--define(RPC_TIMEOUT, 5000).
+-define(RPC_TIMEOUT, 1500).
 
 test_run_node_1() ->
 	{ok, Gateway} = gateway:start_link(),
@@ -84,9 +87,7 @@ run_test(Test) ->
 		Me ! try
 			{ok, Test()}
 		catch
-			throw:Error -> {throw, Error};
-			error:Error -> {error, Error};
-			exit:Error -> {exit, Error}
+			throw:Error -> {throw, Error}
 		end,
 		exit(shutdown)
 	end),
@@ -117,9 +118,9 @@ init([Gateway, ServiceName, Bootstrap]) ->
 		(call, _, {find_successor, ID}) ->
 			find_successor(Server, ID);
 		(call, _, get_predecessor) ->
-			gen_server:call(Server, get_predecessor);
+			get_predecessor(Server);
 		(call, _, get_successor) ->
-			gen_server:call(Server, get_successor);
+			get_successor(Server);
 		(cast, From, notify) ->
 			gen_server:cast(Server, {notify, From})
 	end,
@@ -136,8 +137,17 @@ init([Gateway, ServiceName, Bootstrap]) ->
 	% Must register after joining so we don't just join ourself. This is why you need to start with a bootstrap node.
 	ok = gateway:register(Gateway, ServiceName, RpcHandler),
 	
+	OnNodeAction = fun(_) -> ok end,
+	Events = {OnNodeAction, OnNodeAction},
+	
 	% RPC, MyID, Hash, Predecessor, Successors, NextFinger, Fingers
-	{ok, {RPC, Name, Hash, nil, [Successor], 0, array:new()}}.
+	{ok, {RPC, Events, Name, Hash, nil, [Successor], 0, array:new()}}.
+
+on_node_join(Server, OnNodeJoin) ->
+	gen_server:call(Server, {on_node_join, OnNodeJoin}).
+
+on_node_leave(Server, OnNodeLeave) ->
+	gen_server:call(Server, {on_node_leave, OnNodeLeave}).
 
 join(Gateway, ServiceName, Server, Hash, Wait) ->
 	case gateway:call_group(Gateway, Wait, ServiceName, {find_successor, Hash}) of
@@ -146,6 +156,12 @@ join(Gateway, ServiceName, Server, Hash, Wait) ->
 		timeout -> % retry
 			join(Gateway, ServiceName, Server, Hash, next_wait(Wait))
 	end.
+
+get_predecessor(Server) ->
+	gen_server:call(Server, get_predecessor).
+
+get_successor(Server) ->
+	gen_server:call(Server, get_successor).
 
 next_wait(0) -> 50; % start at 50 ms
 next_wait(Wait) when Wait >= 10000 -> 10000; % max 10 s wait
@@ -179,11 +195,11 @@ handle_cast(Request, State) ->
 	Result.
 
 handle_call(Request, Client, State) ->
-	{{RPC_Call, _RPC_Cast}, _MyID, Hash, Predecessor, [Successor|_Successors], _NextFinger, Fingers} = State,
+	{{RPC_Call, RPC_Cast}, {OnNodeJoin, OnNodeLeave}, MyID, Hash, Predecessor, [Successor|Successors], NextFinger, Fingers} = State,
 	case Request of
 		{find_successor, ID} ->
 			spawn_link(fun() ->
-				case in_half_open_range(ID, Hash, crypto:sha(Successor)) of
+				case key_ranges:in_half_open_range(ID, Hash, crypto:sha(Successor)) of
 					true ->
 						gen_server:reply(Client, {ok, Successor});
 					_ ->
@@ -201,11 +217,16 @@ handle_call(Request, Client, State) ->
 		
 		get_fingers ->
 			Result = sets:to_list(sets:from_list([Successor|array:to_list(Fingers)])),
-			{reply, Result, State}
+			{reply, Result, State};
+		
+		{on_node_join, ONJ} ->
+			{reply, ok, {{RPC_Call, RPC_Cast}, {ONJ, OnNodeLeave}, MyID, Hash, Predecessor, [Successor|Successors], NextFinger, Fingers}};
+		{on_node_leave, ONL} ->
+			{reply, ok, {{RPC_Call, RPC_Cast}, {OnNodeJoin, ONL}, MyID, Hash, Predecessor, [Successor|Successors], NextFinger, Fingers}}
 	end.
 
 handle_info(Request, State) ->
-	{{RPC_Call, RPC_Cast}, MyID, Hash, Predecessor, [Successor|Successors], NextFinger, Fingers} = State,
+	{{RPC_Call, RPC_Cast}, _Events, MyID, Hash, Predecessor, [Successor|Successors], NextFinger, Fingers} = State,
 	case Request of
 		stabilize ->
 			Server = self(),
@@ -224,26 +245,33 @@ handle_info(Request, State) ->
 	end.
 
 my_handle_cast(Request, State) ->
-	{RPC, MyID, Hash, Predecessor, [Successor|Successors], NextFinger, Fingers} = State,
+	{RPC, {OnNodeJoin, OnNodeLeave}, MyID, Hash, Predecessor, [Successor|Successors], NextFinger, Fingers} = State,
 	case Request of
 		{set_successors, NewSuccessors} ->
 			timer:send_after(?STABILIZE_INTERVAL, stabilize),
-			{noreply, {RPC, MyID, Hash, Predecessor, NewSuccessors, NextFinger, Fingers}};
+			{noreply, {RPC, {OnNodeJoin, OnNodeLeave}, MyID, Hash, Predecessor, NewSuccessors, NextFinger, Fingers}};
 		
 		{set_fingers, NewNextFinger, NewFingers} ->
 			timer:send_after(?FIX_FINGERS_INTERVAL, fix_fingers),
-			{noreply, {RPC, MyID, Hash, Predecessor, [Successor|Successors], NewNextFinger, NewFingers}};
+			{noreply, {RPC, {OnNodeJoin, OnNodeLeave}, MyID, Hash, Predecessor, [Successor|Successors], NewNextFinger, NewFingers}};
 		
 		unset_predecessor ->
-			{noreply, {RPC, MyID, Hash, nil, [Successor|Successors], NextFinger, Fingers}};
+			spawn_link(fun() ->
+				OnNodeLeave(Predecessor)
+			end),
+			{noreply, {RPC, {OnNodeJoin, OnNodeLeave}, MyID, Hash, nil, [Successor|Successors], NextFinger, Fingers}};
+			
 		{notify, OtherNode} ->
-			NewPredecessor = case (Predecessor =:= nil) orelse in_open_range(crypto:sha(OtherNode), crypto:sha(Predecessor), Hash) of
+			NewPredecessor = case (Predecessor =:= nil) orelse key_ranges:in_open_range(crypto:sha(OtherNode), crypto:sha(Predecessor), Hash) of
 				true ->
+					spawn_link(fun() ->
+						OnNodeJoin(OtherNode)
+					end),
 					OtherNode;
 				_ ->
 					Predecessor
 			end,
-			{noreply, {RPC, MyID, Hash, NewPredecessor, [Successor|Successors], NextFinger, Fingers}}
+			{noreply, {RPC, {OnNodeJoin, OnNodeLeave}, MyID, Hash, NewPredecessor, [Successor|Successors], NextFinger, Fingers}}
 	end.
 
 closest_preceding_node(Successor, Hash, ID, Fingers) ->
@@ -252,33 +280,9 @@ closest_preceding_node(Successor, _, _, _, 0) -> Successor;
 closest_preceding_node(Successor, Hash, ID, Fingers, LastIndex) ->
 	Index = LastIndex - 1,
 	Finger = array:get(Index, Fingers),
-	case in_open_range(crypto:sha(Finger), Hash, ID) of
+	case key_ranges:in_open_range(crypto:sha(Finger), Hash, ID) of
 		true -> Finger;
 		_ -> closest_preceding_node(Successor, Hash, ID, Fingers, Index)
-	end.
-
-% is Value in (From, To)
-in_open_range(nil, _, _) -> false;
-in_open_range(Value, From, To) ->
-	if
-		(From < To) ->
-			(Value > From) and (Value < To);
-		(To < From) ->
-			(Value > From) or (Value < To);
-		(Value =:= To) -> % and implicitly Value =:= From
-			false;
-		true -> true
-	end.
-
-% is Value in (From, To]
-in_half_open_range(nil, _, _) -> false;
-in_half_open_range(Value, From, To) ->
-	if
-		(From < To) ->
-			(Value > From) and (Value =< To);
-		(To < From) ->
-			(Value > From) or (Value =< To);
-		true -> true
 	end.
 
 set_successors(Server, NewSuccessors) ->
@@ -287,16 +291,19 @@ set_successors(Server, NewSuccessors) ->
 stabilize(Server, {RPC_Call, RPC_Cast}, MyID, Hash, [Successor|Successors], FingerCount) ->
 	RemainingSuccessors = case RPC_Call(Successor, get_predecessor) of
 		{ok, X} -> HashSuccessor = crypto:sha(Successor),
-			NewSuccessor = case X =/= nil andalso in_open_range(crypto:sha(X), Hash, HashSuccessor) of
+			NewSuccessor = case X =/= nil andalso key_ranges:in_open_range(crypto:sha(X), Hash, HashSuccessor) of
 				true ->
 					set_successors(Server, [X|Successors]), X;
 				_ -> Successor
 			end,
-			RPC_Cast(NewSuccessor, notify),
 			[NewSuccessor|Successors];
 		timeout ->
 			Successors
 	end,
+	
+	[NotifySuccessor|_] = RemainingSuccessors,
+	RPC_Cast(NotifySuccessor, notify),
+	
 	NewSuccessors = if
 		length(RemainingSuccessors) =:= 0 ->
 			[MyID];
@@ -326,7 +333,7 @@ fix_fingers(Server, Hash, Index, Fingers) ->
 		Index > 0 ->
 			LastFinger = array:get(Index - 1, Fingers),
 			LastFingerHash = crypto:sha(LastFinger),
-			case in_half_open_range(FingerHash, Hash, LastFingerHash) of
+			case key_ranges:in_half_open_range(FingerHash, Hash, LastFingerHash) of
 				true -> {recurse, LastFinger};
 				_ -> {wait, find_successor(Server, FingerHash)}
 			end;

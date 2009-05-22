@@ -7,16 +7,18 @@
 -behaviour(gen_server).
 
 -export([start_link/0, get/3, put/4, delete/3, prepare/2, commit/2, abort/2]).
+-export([for_each_key/2, forget/2]).
 -export([init/1, terminate/2, handle_info/2, handle_call/3, handle_cast/2, code_change/3]).
+
+-define(VACUUM_INTERVAL, 20000).
 
 start_link() ->
 	gen_server:start_link(?MODULE, [], []).
 
 init([]) ->
-	{ok, VacuumTimer} = timer:send_interval(2000, vacuum),
-	Timers = {VacuumTimer},
-	Table = ets:new(?MODULE, [ordered_set, private]),
-	{ok, {Table, dict:new(), 0, 0, Timers}}.
+	{ok, _} = timer:send_after(?VACUUM_INTERVAL, vacuum),
+	Table = ets:new(?MODULE, [ordered_set, protected]),
+	{ok, {Table, dict:new(), 0, 0}}.
 
 % returns {ok, Value, CreatedTid} or {no_value, DeletedTid} or throws {retry, Clock}
 get(TM, Tid, Key) ->
@@ -41,6 +43,14 @@ commit(TM, Tid) ->
 % returns ok
 abort(TM, Tid) ->
 	gen_server:call(TM, {abort, Tid}).
+
+% perform Operation for each key
+for_each_key(TM, Operation) ->
+	gen_server:call(TM, {for_each_key, Operation}).
+
+% forget a range of keys (if it is owned by another node - for replication)
+forget(TM, Key) ->
+	gen_server:call(TM, {forget, Key}).
 
 get_transaction(Transactions, MaxTid, Tid) ->
 	case dict:find(Tid, Transactions) of
@@ -67,13 +77,13 @@ translate_value(Data, Created) ->
 		no_value -> {no_value, Created}
 	end.
 
-handle_call(Request, _Client, State) ->
-	{Table, Transactions, Clock, MaxTid, Timers} = State,
+handle_call(Request, Client, State) ->
+	{Table, Transactions, Clock, MaxTid} = State,
 	case Request of
 		{get, Tid, Key} ->
 			if
 				Tid < Clock ->
-					{reply, {retry, Clock}, {Table, dict:erase(Tid, Transactions), Clock, MaxTid, Timers}};
+					{reply, {retry, Clock}, {Table, dict:erase(Tid, Transactions), Clock, MaxTid}};
 				true ->
 					{NewTransactions, BeginTransactions, NewMaxTid} = get_transaction(Transactions, MaxTid, Tid),
 					case ets:select(Table, [{
@@ -88,17 +98,17 @@ handle_call(Request, _Client, State) ->
 								[{{'$1', '$2', '$3', '$4'}}]
 							}])) of
 								[] ->
-									{reply, {no_value, 0}, {Table, NewTransactions, Clock, NewMaxTid, Timers}};
+									{reply, {no_value, 0}, {Table, NewTransactions, Clock, NewMaxTid}};
 								List ->
 									{Create, Value, LastRead, Expired} = lists:last(List),
 									if
 										Tid > LastRead -> ets:insert(Table, {{Key, Create}, Value, Tid, Expired});
 										true -> do_nothing
 									end,
-									{reply, translate_value(Value, Create), {Table, NewTransactions, Clock, NewMaxTid, Timers}}
+									{reply, translate_value(Value, Create), {Table, NewTransactions, Clock, NewMaxTid}}
 							end;
 						List ->
-							{reply, translate_value(lists:last(List), Tid), {Table, NewTransactions, Clock, NewMaxTid, Timers}}
+							{reply, translate_value(lists:last(List), Tid), {Table, NewTransactions, Clock, NewMaxTid}}
 					end
 			end;
 
@@ -117,23 +127,23 @@ handle_call(Request, _Client, State) ->
 						[{'<', '$1', Tid}, {'=/=', '$3', uncommitted}, {'=/=', '$3', prepared}],
 						['$1']
 					}])) of
-						true -> % conflicting write committed while we this transaction was working.
-							{reply, {retry, 0}, {Table, dict:erase(Tid, NewTransactions), Clock, NewMaxTid, Timers}};
+						true -> % conflicting write committed while this transaction was working.
+							{reply, {retry, 0}, {Table, dict:erase(Tid, NewTransactions), Clock, NewMaxTid}};
 						_ ->
 							ets:insert(Table, {{Key, Tid}, Value, uncommitted, current}),
-							{reply, ok, {Table, NewTransactions, Clock, NewMaxTid, Timers}}
+							{reply, ok, {Table, NewTransactions, Clock, NewMaxTid}}
 					end;
 				Clocks -> % conflict
-					{reply, {retry, lists:max(Clocks)}, {Table, dict:erase(Tid, NewTransactions), Clock, NewMaxTid, Timers}}
+					{reply, {retry, lists:max(Clocks)}, {Table, dict:erase(Tid, NewTransactions), Clock, NewMaxTid}}
 			end;
 		
-		% On recovery, one would recover "prepared" entires, and discard "uncommitted" ones.
+		% On recovery, one would recover "prepared" entries, and discard "uncommitted" ones.
 		{prepare, Tid} ->
 			{NewTransactions, _, NewMaxTid} = get_transaction(Transactions, MaxTid, Tid),
 			lists:map(fun([Key, Value, Expired]) ->
 				ets:insert(Table, {{Key, Tid}, Value, prepared, Expired})
 			end, ets:match(Table, {{'$1', Tid}, '$2', uncommitted, '$3'})),
-			{reply, ok, {Table, NewTransactions, Clock, NewMaxTid, Timers}};
+			{reply, ok, {Table, NewTransactions, Clock, NewMaxTid}};
 		
 		{commit, Tid} ->
 			{NewTransactions, _, NewMaxTid} = get_transaction(Transactions, MaxTid, Tid),
@@ -148,23 +158,55 @@ handle_call(Request, _Client, State) ->
 				% commit this entry
 				ets:insert(Table, {{Key, Tid}, Value, Tid, Expired})
 			end, ets:match(Table, {{'$1', Tid}, '$2', prepared, '$3'})),
-			{reply, ok, {Table, dict:erase(Tid, NewTransactions), Clock, NewMaxTid, Timers}};
+			{reply, ok, {Table, dict:erase(Tid, NewTransactions), Clock, NewMaxTid}};
 		
 		{abort, Tid} ->
 			{NewTransactions, _, NewMaxTid} = get_transaction(Transactions, MaxTid, Tid),
 			ets:match_delete(Table, {{'$1', Tid}, '$2', '$3', '$4'}),
-			{reply, ok, {Table, dict:erase(Tid, NewTransactions), Clock, NewMaxTid, Timers}}
+			{reply, ok, {Table, dict:erase(Tid, NewTransactions), Clock, NewMaxTid}};
+		
+		{for_each_key, Operation} ->
+			spawn_link(fun() ->
+				case ets:select(Table, [{
+					{{'$1', '$2'}, '$3', '$4', current},
+					['$1']
+				}], 100) of
+					{Match, Continuation} -> do_for_each_key(Match, Continuation, Operation);
+					'$end_of_table' -> done
+				end,
+				gen_server:reply(Client, ok)
+			end),
+			{noreply, State};
+		
+		{forget, Key} -> % Completely forget a given key. This is for replication garbage collection. For ordinarily deleting an element, use delete.
+			ets:select_delete(Table, [{
+				{{Key, '$1'}, '$2', '$3', '$4'},
+				[],
+				[true]
+			}]),
+			{reply, ok, State}
 	end.
 
+do_for_each_key([], Continuation, Operation) ->
+	case ets:select(Continuation) of
+		'$end_of_table' -> done;
+		{Match, NewContinuation} -> do_for_each_key(Match, NewContinuation, Operation)
+	end;
+do_for_each_key([Key|Rest], Continuation, Operation) ->
+	Operation(Key),
+	do_for_each_key(Rest, Continuation, Operation).
+	
+
 vacuum(State) ->
-	{Table, Transactions, _Clock, MaxTid, Timers} = State,
+	{Table, Transactions, _Clock, MaxTid} = State,
 	NewClock = lists:min([MaxTid|dict:fetch_keys(Transactions)]),
 	ets:select_delete(Table, [{
 		{{'$1', '$2'}, '$3', '$4', '$5'},
 		[{'<', '$2', NewClock}, {'=/=', '$5', current}],
 		[true]
 	}]),
-	{Table, Transactions, NewClock, MaxTid, Timers}.
+	{ok, _} = timer:send_after(?VACUUM_INTERVAL, vacuum),
+	{Table, Transactions, NewClock, MaxTid}.
 
 handle_cast(_Request, State) ->
 	{noreply, State}.
@@ -174,12 +216,8 @@ handle_info(Request, State) ->
 		vacuum -> {noreply, vacuum(State)}
 	end.
 
-terminate(_Reason, {Table, _, _, _, Timers}) ->
-	{VacuumTimer} = Timers,
-	{ok, cancel} = timer:cancel(VacuumTimer),
-	
-	ets:delete(Table),
-	
+terminate(_Reason, {Table, _, _, _}) ->
+	ets:delete(Table),	
 	ok.
 
 code_change(_Version, State, _Extra) -> {ok, State}.
