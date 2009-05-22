@@ -244,7 +244,8 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 	{ok, Chord} = chord:start_link(Gateway, ServiceName, Bootstrap),
 	
 	% On node join, re-replicate all keys, since any may need to be replicated to the new node
-	chord:on_node_join(Chord, fun(_) ->
+	chord:on_node_join(Chord, fun(Node) ->
+		io:format("node joins! ~p~n", [Node]),
 		tm:for_each_key(TM, fun(Key) ->
 			reify(Gateway, SN, Key)
 		end)
@@ -252,6 +253,7 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 	
 	% On node leave, re-replicate all keys not in (P, N], since those belong to this node
 	chord:on_node_leave(Chord, fun(Node) ->
+		io:format("node leaves! ~p~n", [Node]),
 		tm:for_each_key(TM, fun(Key) ->
 			case key_ranges:in_half_open_range(crypto:sha(term_to_binary(Key)), Node, Hash) of
 				true -> skip;
@@ -288,6 +290,7 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 		(call, _, {prepare, Tid}) ->
 			tm:prepare(TM, Tid);
 		(cast, _, {commit, Tid}) ->
+			sync_clock(DTM, Tid),
 			tm:commit(TM, Tid);
 		
 		(cast, _, {keep_alive, From, To, R}) ->
@@ -305,9 +308,11 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 
 % re-replicate a key: Put(Key, Get(Key))
 reify(Gateway, ServiceName, Key) ->
-	transaction(Gateway, ServiceName, 5000, fun(Get, Put, _) ->
+	io:format("reify ~p~n", [Key]),
+	transaction(Gateway, ServiceName, 5000, fun(Get, Put, Delete) ->
 		case Get(Key) of
-			no_value -> ok;
+			no_value ->
+				ok = Delete(Key);
 			{ok, Value} ->
 				ok = Put(Key, Value)
 		end
@@ -325,6 +330,11 @@ make_tid(Clock, Name) ->
 	Size = size(Name) * 8,
 	<<NameNum:Size>> = Name,
 	NameNum bor (Clock bsl Size).
+
+% Sync the local clock up to a given Tid.
+sync_clock(DTM, Tid) ->
+	gen_server:call(DTM, {sync_clock, Tid}).
+
 
 % Given a known Tid (timestamp), return the new clock to use for future
 % transactions.
@@ -370,6 +380,8 @@ reduce_get_results(Result, Acc) ->
 					{ok, Value2, Created2};
 				{ok, {no_value, Deleted}} when Deleted > Created ->
 					{no_value, Deleted};
+				{ok, {retry, Retry}} when Retry > Created ->
+					{retry, Retry};
 				_ -> Acc
 			end;
 		{no_value, Deleted} ->
@@ -379,16 +391,18 @@ reduce_get_results(Result, Acc) ->
 					{ok, Value, Created};
 				{ok, {no_value, Deleted2}} when Deleted2 > Deleted ->
 					{no_value, Deleted2};
+				{ok, {retry, Retry}} when Retry > Deleted ->
+					{retry, Retry};
 				_ -> Acc
 			end;
-		{retry, Clock} ->
+		{retry, Retry} ->
 			case Result of
 				timeout -> Acc;
-				{ok, {ok, Value, Created}} ->
+				{ok, {ok, Value, Created}} when Created > Retry ->
 					{ok, Value, Created};
-				{ok, {no_value, Deleted}} ->
+				{ok, {no_value, Deleted}} when Deleted > Retry ->
 					{no_value, Deleted};
-				{ok, {retry, Clock2}} when Clock2 > Clock -> {retry, Clock2};
+				{ok, {retry, Retry2}} when Retry2 > Retry -> {retry, Retry2};
 				_ -> Acc
 			end;
 		no_reply ->
@@ -438,10 +452,14 @@ reduce_prepare_results(Result, Acc) ->
 handle_call(Request, Client, State) ->
 	{{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, Clock, Transactions, KeyRanges} = State,
 	case Request of
+		{sync_clock, Tid} ->
+			NewClock = new_clock(Clock, Name, Tid),
+			{reply, ok, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, NewClock, Transactions, KeyRanges}};
+		
 		{begin_transaction, MinimumTid} ->
 			NewClock = new_clock(Clock, Name, MinimumTid),
 			Tid = make_tid(NewClock, Name),
-			{reply, Tid, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, NewClock, dict:store(Tid, sets:new(), Transactions, KeyRanges)}};
+			{reply, Tid, {{RPC_Call, RPC_Cast}, Gateway, Name, Chord, TM, Replication, NewClock, dict:store(Tid, sets:new(), Transactions), KeyRanges}};
 
 		{get, Tid, Key} ->
 			Nodes = find_nodes(Chord, Key, Replication),

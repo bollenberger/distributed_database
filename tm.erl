@@ -48,7 +48,7 @@ abort(TM, Tid) ->
 for_each_key(TM, Operation) ->
 	gen_server:call(TM, {for_each_key, Operation}).
 
-% forget a range of keys (if it is owned by another node - for replication)
+% forget a key completely
 forget(TM, Key) ->
 	gen_server:call(TM, {forget, Key}).
 
@@ -77,7 +77,7 @@ translate_value(Data, Created) ->
 		no_value -> {no_value, Created}
 	end.
 
-handle_call(Request, Client, State) ->
+handle_call(Request, _Client, State) ->
 	{Table, Transactions, Clock, MaxTid} = State,
 	case Request of
 		{get, Tid, Key} ->
@@ -169,14 +169,14 @@ handle_call(Request, Client, State) ->
 			spawn_link(fun() ->
 				case ets:select(Table, [{
 					{{'$1', '$2'}, '$3', '$4', current},
+					[],
 					['$1']
 				}], 100) of
 					{Match, Continuation} -> do_for_each_key(Match, Continuation, Operation);
 					'$end_of_table' -> done
-				end,
-				gen_server:reply(Client, ok)
+				end
 			end),
-			{noreply, State};
+			{reply, ok, State};
 		
 		{forget, Key} -> % Completely forget a given key. This is for replication garbage collection. For ordinarily deleting an element, use delete.
 			ets:select_delete(Table, [{

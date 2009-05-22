@@ -184,7 +184,7 @@ readable_name(Name) ->
 	Readable.
 
 show_state(_) -> ok.
-%show_state({_RPC, MyID, _Hash, Predecessor, [Successor|_], _NextFinger, _Fingers}) ->
+%show_state({_RPC, _OnNodeActions, MyID, _Hash, Predecessor, [Successor|_], _NextFinger, _Fingers}) ->
 %	io:format("~p <- ~p -> ~p~n", [readable_name(Predecessor), readable_name(MyID), readable_name(Successor)]).
 
 handle_cast(Request, State) ->
