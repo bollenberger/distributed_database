@@ -245,7 +245,6 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 	
 	% On node join, re-replicate all keys, since any may need to be replicated to the new node
 	chord:on_node_join(Chord, fun(Node) ->
-		io:format("node joins! ~p~n", [Node]),
 		tm:for_each_key(TM, fun(Key) ->
 			reify(Gateway, SN, Key)
 		end)
@@ -253,7 +252,6 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 	
 	% On node leave, re-replicate all keys not in (P, N], since those belong to this node
 	chord:on_node_leave(Chord, fun(Node) ->
-		io:format("node leaves! ~p~n", [Node]),
 		tm:for_each_key(TM, fun(Key) ->
 			case key_ranges:in_half_open_range(crypto:sha(term_to_binary(Key)), Node, Hash) of
 				true -> skip;
@@ -308,7 +306,6 @@ init([Gateway, SN, Replication, Bootstrap]) ->
 
 % re-replicate a key: Put(Key, Get(Key))
 reify(Gateway, ServiceName, Key) ->
-	io:format("reify ~p~n", [Key]),
 	transaction(Gateway, ServiceName, 5000, fun(Get, Put, Delete) ->
 		case Get(Key) of
 			no_value ->
