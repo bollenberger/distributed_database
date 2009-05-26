@@ -58,15 +58,19 @@ add_route_to_list(Acc, _, nil, nil, [], _) ->
 		(_) -> true
 	end, lists:reverse(Acc));
 add_route_to_list(Acc, Dest, nil, nil, [Route|Rest], NotifyPeers) -> add_route_to_list([Route|Acc], Dest, nil, nil, Rest, NotifyPeers);
-add_route_to_list(Acc, Dest, Router, Metric, [], NotifyPeers) -> % add route to end of list
+add_route_to_list([], Dest, Router, Metric, [], NotifyPeers) ->
 	NotifyPeers(Dest, Metric),
+	add_route_to_list([{Router, Metric}], Dest, nil, nil, [], NotifyPeers);
+add_route_to_list(Acc, Dest, Router, Metric, [], NotifyPeers) -> % add route to end of list
 	add_route_to_list([{Router, Metric}|Acc], Dest, nil, nil, [], NotifyPeers);
 add_route_to_list(Acc, Dest, Router, Metric, [{Router, Metric}|Rest], NotifyPeers) -> % no change
 	add_route_to_list([{Router, Metric}|Acc], Dest, nil, nil, Rest, NotifyPeers);
 add_route_to_list(Acc, Dest, Router, Metric, [{Router, _}|Rest], NotifyPeers) -> % changed metric
 	add_route_to_list(Acc, Dest, Router, Metric, Rest, NotifyPeers);
-add_route_to_list(Acc, Dest, Router, Metric, [{OtherRouter, OtherMetric}|Rest], NotifyPeers) when OtherMetric >= Metric -> % insert route
+add_route_to_list([], Dest, Router, Metric, [{OtherRouter, OtherMetric}|Rest], NotifyPeers) when OtherMetric >= Metric ->
 	NotifyPeers(Dest, Metric),
+	add_route_to_list([{Router, Metric}], Dest, nil, nil, [{OtherRouter, OtherMetric}|Rest], NotifyPeers);
+add_route_to_list(Acc, Dest, Router, Metric, [{OtherRouter, OtherMetric}|Rest], NotifyPeers) when OtherMetric >= Metric -> % insert route
 	add_route_to_list([{Router, Metric}|Acc], Dest, nil, nil, [{OtherRouter, OtherMetric}|Rest], NotifyPeers);
 add_route_to_list(Acc, Dest, Router, Metric, [OtherRoute|Rest], NotifyPeers) ->
 	add_route_to_list([OtherRoute|Acc], Dest, Router, Metric, Rest, NotifyPeers).

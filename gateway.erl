@@ -445,6 +445,9 @@ handle_cast(Request, State) ->
 		
 		{receive_message, _FromID, heartbeat} ->
 			{noreply, State};
+		{receive_message, _, {link, MyID, _}} ->
+			% got a route to ourself. ignore it.
+			{noreply, State};
 		{receive_message, FromID, {link, Dest, Metric}} ->
 			%io:format("~p learned that ~p can route to ~p with metric ~p~n", [MyID, FromID, Dest, Metric]),
 			Peer = dict:fetch(FromID, Peers),
